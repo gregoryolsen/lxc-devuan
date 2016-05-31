@@ -1,0 +1,825 @@
+#!/bin/bash
+
+#
+# lxc: linux Container library
+#
+
+# lxc-devuan  (container template)
+#
+# This is a derivative work based upon lxc-debian.
+#
+# Authors:
+# Daniel Lezcano <daniel.lezcano@free.fr>  (lxc-debian)
+# Greg Olsen     <gregolsen@computer.org>  (lxc-devuan)
+#
+# Copyright (c) 2016 Greg Olsen
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+#
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+
+# Detect use under userns (unsupported)
+for arg in "$@"; do
+    [ "$arg" = "--" ] && break
+    if [ "$arg" = "--mapped-uid" -o "$arg" = "--mapped-gid" ]; then
+        echo "This template can't be used for unprivileged containers." 1>&2
+        echo "You may want to try the \"download\" template instead." 1>&2
+        exit 1
+    fi
+done
+
+# Make sure the usual locations are in PATH
+export PATH=$PATH:/usr/sbin:/usr/bin:/sbin:/bin
+export GREP_OPTIONS=""
+
+MIRROR=${MIRROR:-http://auto.mirror.devuan.org/merged}
+SECURITY_MIRROR=${SECURITY_MIRROR:-http://auto.mirror.devuan.org/merged}
+LOCALSTATEDIR="/var"
+LXC_TEMPLATE_CONFIG="/usr/share/lxc/config"
+DOWNLOAD_KEYRING=1       # auto-download devuan-keyring.gpg (if not found)
+DEFAULT_NO_CHECK_GPG=1   # default "--no-check-gpg" (if keyring not found/downloaded)
+
+# Greg Olsen 2016-05-04
+# - Organizationally Unique Identifier (MAC address prefix)
+#   Don't change this unless you know what your doing.
+OUI=${OUI:-'00:16:3e'}   # default OUI (Vendor: Xensource, Inc.)
+
+# Greg Olsen 2016-05-04
+# - DEBOOTSTRAP OPTION is workaround for "Release signed by unknown key".
+#   This tries hard to avoid the unknown key problem provided both the
+#   DOWNLOAD_KEYRING and DEFAULT_NO_CHECK_GPG options are enabled (1).
+DEBOOTSTRAP_OPTION=""
+if [[ -f /usr/share/keyrings/devuan-keyring.gpg ]]; then
+   DEBOOTSTRAP_OPTION="--keyring=/usr/share/keyrings/devuan-keyring.gpg"
+elif [[ -f /etc/apt/trusted.gpg.d/devuan-keyring.gpg ]]; then
+   DEBOOTSTRAP_OPTION="--keyring=/etc/apt/trusted.gpg.d/devuan-keyring.gpg"
+elif ((DOWNLOAD_KEYRING)) ; then
+   if [[ "$(id -u)" != "0" ]]; then
+      echo "Must be root (sudo) to save /etc/apt/trusted.gpg.d/devuan-keyring.gpg"
+   else
+      echo "Downloading Devuan keyring archive.zip"
+      mkdir -p /etc/apt/trusted.gpg.d/devuan-keyring-master
+      pushd /etc/apt/trusted.gpg.d >/dev/null
+      # Git protocol wont work for unregistered users. Have to wget the zip archive.
+      cd ./devuan-keyring-master
+      wget https://git.devuan.org/devuan-packages/devuan-keyring/repository/archive.zip
+      unzip archive.zip */devuan-keyring.gpg
+      mv devuan-keyring-master-*/keyrings/devuan-keyring.gpg ..
+      cd ..
+      rm -rf ./devuan-keyring-master
+      popd >/dev/null
+      if [[ -f /etc/apt/trusted.gpg.d/devuan-keyring.gpg ]]; then
+         echo "Devuan keyring extracted and saved as /etc/apt/trusted.gpg.d/devuan-keyring.gpg"
+         DEBOOTSTRAP_OPTION="--keyring=/etc/apt/trusted.gpg.d/devuan-keyring.gpg"
+      fi
+   fi
+fi
+if [[ -z "$DEBOOTSTRAP_OPTION" ]]; then
+   echo "WARNING: Devuan keyring not found"
+   if ((DEFAULT_NO_CHECK_GPG)) ; then
+      echo "WARNING: Bypassing GPG verification"
+      DEBOOTSTRAP_OPTION="--no-check-gpg"
+   fi
+fi
+
+
+# Greg Olsen 2016-05-04
+# - updated /etc/hosts
+# - set initial localtime as on host
+configure_devuan()
+{
+    rootfs=$1
+    hostname=$2
+    echo "configure_devuan $@"
+    # squeeze only has /dev/tty and /dev/tty0 by default,
+    # therefore creating missing device nodes for tty1-4.
+    for tty in $(seq 1 4); do
+        if [ ! -e $rootfs/dev/tty$tty ]; then
+            mknod $rootfs/dev/tty$tty c 4 $tty
+        fi
+    done
+
+    # configure the inittab
+    cat <<EOF > $rootfs/etc/inittab
+id:3:initdefault:
+si::sysinit:/etc/init.d/rcS
+l0:0:wait:/etc/init.d/rc 0
+l1:1:wait:/etc/init.d/rc 1
+l2:2:wait:/etc/init.d/rc 2
+l3:3:wait:/etc/init.d/rc 3
+l4:4:wait:/etc/init.d/rc 4
+l5:5:wait:/etc/init.d/rc 5
+l6:6:wait:/etc/init.d/rc 6
+# Normally not reached, but fallthrough in case of emergency.
+z6:6:respawn:/sbin/sulogin
+1:2345:respawn:/sbin/getty 38400 console
+c1:12345:respawn:/sbin/getty 38400 tty1 linux
+c2:12345:respawn:/sbin/getty 38400 tty2 linux
+c3:12345:respawn:/sbin/getty 38400 tty3 linux
+c4:12345:respawn:/sbin/getty 38400 tty4 linux
+p6::ctrlaltdel:/sbin/init 6
+p0::powerfail:/sbin/init 0
+EOF
+
+    # symlink mtab
+    [ -e "$rootfs/etc/mtab" ] && rm $rootfs/etc/mtab
+    ln -s /proc/self/mounts $rootfs/etc/mtab
+
+    # disable selinux in devuan
+    mkdir -p $rootfs/selinux
+    echo 0 > $rootfs/selinux/enforce
+
+    # configure the network using the dhcp
+    # - add post-up ethtool -K eth0 tx off / fix offload checksum problem
+    cat <<EOF > $rootfs/etc/network/interfaces
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+EOF
+
+    # set the hostname
+    cat <<EOF > $rootfs/etc/hostname
+$hostname
+EOF
+
+    # set minimal hosts
+    cat <<EOF > $rootfs/etc/hosts
+127.0.0.1   localhost
+127.0.1.1   $hostname
+
+# The following lines are desirable for IPv6 capable hosts
+::1     ip6-localhost ip6-loopback
+fe00::0 ip6-localnet
+ff00::0 ip6-mcastprefix
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+ff02::3 ip6-allhosts
+EOF
+
+    # reconfigure some services
+
+    # remove pointless services in a container
+    chroot $rootfs /usr/sbin/update-rc.d -f checkroot.sh disable
+    chroot $rootfs /usr/sbin/update-rc.d -f umountfs disable
+    chroot $rootfs /usr/sbin/update-rc.d -f hwclock.sh disable
+    chroot $rootfs /usr/sbin/update-rc.d -f hwclockfirst.sh disable
+
+    # generate new SSH keys
+    if [ -x $rootfs/var/lib/dpkg/info/openssh-server.postinst ]; then
+        cat > $rootfs/usr/sbin/policy-rc.d << EOF
+#!/bin/sh
+exit 101
+EOF
+        chmod +x $rootfs/usr/sbin/policy-rc.d
+
+        if [ -f $rootfs/etc/init/ssh.conf ]; then
+            mv $rootfs/etc/init/ssh.conf $rootfs/etc/init/ssh.conf.disabled
+        fi
+
+        rm -f $rootfs/etc/ssh/ssh_host_*key*
+
+        DPKG_MAINTSCRIPT_PACKAGE=openssh DPKG_MAINTSCRIPT_NAME=postinst chroot $rootfs /var/lib/dpkg/info/openssh-server.postinst configure
+        sed -i "s/root@$(hostname)/root@$hostname/g" $rootfs/etc/ssh/ssh_host_*.pub
+
+        if [ -f "$rootfs/etc/init/ssh.conf.disabled" ]; then
+            mv $rootfs/etc/init/ssh.conf.disabled $rootfs/etc/init/ssh.conf
+        fi
+
+        rm -f $rootfs/usr/sbin/policy-rc.d
+    fi
+
+    # Greg Olsen 2016-05-05
+    # - set initial timezone from host
+    [ -e $rootfs/etc/localtime ] && \
+       mv -f $rootfs/etc/localtime $rootfs/etc/localtime.debootstrap
+    [ -e $rootfs/etc/timezone ] && \
+       mv -f $rootfs/etc/timezone $rootfs/etc/timezone.debootstrap
+    if [ -f /etc/localtime ]; then
+       cat /etc/localtime > $rootfs/etc/localtime
+    elif [ -f /etc/timezone ]; then
+        cat /etc/timezone > $rootfs/etc/timezone
+        chroot $rootfs dpkg-reconfigure -f noninteractive tzdata
+    elif [ -f /etc/sysconfig/clock ]; then
+        . /etc/sysconfig/clock
+        echo $ZONE > $rootfs/etc/timezone
+        chroot $rootfs dpkg-reconfigure -f noninteractive tzdata
+    elif [ -f $rootfs/usr/share/zoneinfo/posixrules ]; then
+       cat $rootfs/usr/share/zoneinfo/posixrules > $rootfs/etc/localtime
+    else
+        echo "Timezone in container is not configured. Adjust it manually."
+    fi
+
+    echo "root:root" | chroot $rootfs chpasswd
+    echo "Root password is 'root', please change !"
+
+    return 0
+}
+
+write_sourceslist()
+{
+    local rootfs="$1";  shift
+    local release="$1"; shift
+    local arch="$1";    shift
+
+    local prefix="deb"
+    if [ -n "${arch}" ]; then
+        prefix="deb [arch=${arch}]"
+    fi
+
+    if [ "$mainonly" = 1 ]; then
+      non_main=''
+    else
+      non_main=' contrib non-free'
+    fi
+
+    cat >> "${rootfs}/etc/apt/sources.list" << EOF
+${prefix} $MIRROR ${release}          main${non_main}
+EOF
+
+    if [ "$release" != "unstable" -a "$release" != "ceres" ]; then
+      cat >> "${rootfs}/etc/apt/sources.list" << EOF
+${prefix} $MIRROR ${release}-updates  main${non_main}
+${prefix} $SECURITY_MIRROR ${release}-security main${non_main}
+EOF
+    fi
+}
+
+# Greg Olsen 2016-05-04
+# - new function, help keep things minimal
+write_apt_conf_d ()
+{
+    local rootfs="$1";
+
+    cat >> "${rootfs}/etc/apt/apt.conf.d/01lean" << EOF
+APT::Install-Suggests "0";
+APT::Install-Recommends "0";
+APT::AutoRemove::SuggestsImportant "false";
+APT::AutoRemove::RecommendsImportant "false";
+EOF
+}
+
+# Greg Olsen 2016-05-04
+# - new function, auto-update resolv.conf OpenDNS server tail
+write_resolv_conf_d_tail ()
+{
+    local rootfs="$1";
+    mkdir -p -m 775 "${rootfs}/etc/resolvconf/resolv.conf.d"
+    if [[ -e "${rootfs}/etc/resolvconf/resolv.conf.d/tail" ]]; then
+       mv -f "${rootfs}/etc/resolvconf/resolv.conf.d/tail" \
+             "${rootfs}/etc/resolvconf/resolv.conf.d/tail.orig"
+    fi
+    cat > "${rootfs}/etc/resolvconf/resolv.conf.d/tail" << EOF
+# tail
+nameserver 208.67.222.222
+nameserver 208.67.220.220
+EOF
+}
+
+install_packages()
+{
+    local rootfs="$1"; shift
+    local packages="$*"
+
+    chroot ${rootfs} apt-get update
+    if [ -n "${packages}" ]; then
+        chroot ${rootfs} apt-get install --force-yes -y --no-install-recommends ${packages}
+    fi
+}
+
+cleanup()
+{
+    rm -rf $cache/partial-$release-$arch
+    rm -rf $cache/rootfs-$release-$arch
+}
+
+# Greg Olsen 2016-05-04 -Less bare bones than from debootstrap, however dependencies are kept minimal.
+# Add packages
+#   * Network:  iputils-ping, dnsutils, resolvconf, traceroute, curl, wget, netcat-traditional, telnet
+#   * Utils:    less, diffutils, screen, man-db, manpages, sysv-rc-conf, apt-utils, psmisc, tree, rsync, htop
+#   * Editors:  vim-tiny, zile, nano
+#   * Security: ca-certificates, devuan-keyring
+download_devuan()
+{
+    packages=\
+ifupdown,\
+locales,\
+libui-dialog-perl,\
+dialog,\
+sysv-rc-conf,\
+isc-dhcp-client,\
+netbase,\
+net-tools,\
+telnet,\
+iproute2,\
+dnsutils,\
+resolvconf,\
+traceroute,\
+iputils-ping,\
+netcat-traditional,\
+openssh-server,\
+devuan-keyring,\
+ca-certificates,\
+apt-utils,\
+psmisc,\
+tree,\
+rsync,\
+curl,\
+wget,\
+less,\
+vim-tiny,\
+zile,\
+nano,\
+man-db,\
+manpages,\
+htop
+
+    cache=$1
+    arch=$2
+    release=$3
+
+    trap cleanup EXIT SIGHUP SIGINT SIGTERM
+    # check the mini devuan was not already downloaded
+    mkdir -p "$cache/partial-$release-$arch"
+    if [ $? -ne 0 ]; then
+        echo "Failed to create '$cache/partial-$release-$arch' directory"
+        return 1
+    fi
+
+    # download a mini devuan into a cache
+    echo "Downloading devuan minimal ..."
+    debootstrap --verbose --variant=minbase --arch=$arch \
+        --include=$packages ${DEBOOTSTRAP_OPTION} \
+        "$release" "$cache/partial-$release-$arch" $MIRROR
+    if [ $? -ne 0 ]; then
+        echo "Failed to download the rootfs, aborting."
+        return 1
+    fi
+
+    mv "$1/partial-$release-$arch" "$1/rootfs-$release-$arch"
+    echo "Download complete."
+    trap EXIT
+    trap SIGINT
+    trap SIGTERM
+    trap SIGHUP
+
+    return 0
+}
+
+copy_devuan()
+{
+    cache=$1
+    arch=$2
+    rootfs=$3
+    release=$4
+
+    # make a local copy of the minidevuan
+    echo -n "Copying rootfs to $rootfs..."
+    mkdir -p $rootfs
+    rsync -Ha "$cache/rootfs-$release-$arch"/ $rootfs/ || return 1
+    return 0
+}
+
+install_devuan()
+{
+    cache="$LOCALSTATEDIR/cache/lxc/devuan"
+    rootfs=$1
+    release=$2
+    arch=$3
+    mkdir -p $LOCALSTATEDIR/lock/subsys/
+    (
+        flock -x 9
+        if [ $? -ne 0 ]; then
+            echo "Cache repository is busy."
+            return 1
+        fi
+
+        echo "Checking cache download in $cache/rootfs-$release-$arch ... "
+        if [ ! -e "$cache/rootfs-$release-$arch" ]; then
+            download_devuan $cache $arch $release
+            if [ $? -ne 0 ]; then
+                echo "Failed to download 'devuan base'"
+                return 1
+            fi
+        fi
+
+        copy_devuan $cache $arch $rootfs $release
+        if [ $? -ne 0 ]; then
+            echo "Failed to copy rootfs"
+            return 1
+        fi
+
+        return 0
+
+        ) 9>$LOCALSTATEDIR/lock/subsys/lxc-devuan
+
+    return $?
+}
+
+# Greg Olsen 2016-05-04
+# - add ${OUI} in place of 00:16:3e (set default up top)
+# - relocate entries (similar to lxc-ubuntu)
+# - lxc.network.hwaddr set from /etc/ethers.used (keyed by hostname)
+#       format: MACADDR  IPADDR  HOSTNAME  COMMENT
+copy_configuration()
+{
+    path=$1
+    rootfs=$2
+    hostname=$3
+    arch=$4
+    echo "copy_configuration $@"
+    # Generate the configuration file
+    # if there is exactly one veth network entry, make sure it has an
+    # associated hwaddr.
+    nics=`grep -e '^lxc\.network\.type[ \t]*=[ \t]*veth' $path/config | wc -l`
+    # Greg Olsen 2016-05-04
+    # - add ${OUI} in place of 00:16:3e (set default up top)
+    if [ $nics -eq 1 ]; then
+        grep -q "^lxc.network.hwaddr" $path/config || \
+           sed -i -e "/^lxc\.network\.type[ \t]*=[ \t]*veth/a lxc.network.hwaddr = ${OUI}:$(openssl rand -hex 3| sed 's/\(..\)/\1:/g; s/.$//')" $path/config
+    fi
+
+    # Generate the configuration file
+    ## Relocate rootfs entry if it exists at this point
+    sed -i -e "/lxc.rootfs/{w ${path}/config-rootfs" -e "d}" $path/config
+
+    ## Relocate all the network config entries
+    sed -i -e "/lxc.network/{w ${path}/config-network" -e "d}" $path/config
+
+    ## Relocate any other config entries
+    sed -i -e "/lxc./{w ${path}/config-auto" -e "d}" $path/config
+
+    ## Add all the includes
+    echo "" >> $path/config
+    echo "# Common configuration" >> $path/config
+    if [ -e "${LXC_TEMPLATE_CONFIG}/devuan.common.conf" ]; then
+        echo "lxc.include = ${LXC_TEMPLATE_CONFIG}/devuan.common.conf" >> $path/config
+    fi
+    if [ -e "${LXC_TEMPLATE_CONFIG}/devuan.${release}.conf" ]; then
+        echo "lxc.include = ${LXC_TEMPLATE_CONFIG}/devuan.${release}.conf" >> $path/config
+    fi
+
+    ## Add the default config
+    if [ -e "$path/config-auto" ]; then
+       echo "" >> $path/config
+       echo "# Default configuration" >> $path/config
+       cat $path/config-auto >> $path/config && rm $path/config-auto
+    fi
+
+    ## Add the container-specific config
+    echo "" >> $path/config
+    echo "# Container specific configuration" >> $path/config
+    [ -e "$path/config-rootfs" ] && cat $path/config-rootfs >> $path/config && rm $path/config-rootfs
+    grep -q "^lxc.rootfs" $path/config 2> /dev/null || echo "lxc.rootfs = $rootfs" >> $path/config
+    cat <<EOF >> $path/config
+lxc.utsname = $hostname
+lxc.arch = $arch
+EOF
+
+    ## Edit and re-add the previously removed network config
+    echo "" >> $path/config
+    echo "# Network configuration" >> $path/config
+    #
+    # Greg Olsen 2016-05-04
+    # - lxc.network.hwaddr set from /etc/ethers.used (keyed by hostname)
+    #     line format: MACADDR  IPADDR  HOSTNAME  COMMENT
+    if [[ -f /etc/ethers.used ]]; then  # line format: MACADDR  IPADDR  HOSTNAME  COMMENT
+       # Replace hwaddr with the one found matching on hostname
+       LXC_NET_HWADDR=$(egrep "(\ |\t)$hostname(\ |\t)" /etc/ethers.used | sed -e "s/[[:space:]]\+/ /g" | cut -d' ' -f1-3 | sed -e 's/ /  # /')
+       if [[ -n "$LXC_NET_HWADDR" ]]; then
+          sed -i -e "s/lxc.network.hwaddr.*/lxc.network.hwaddr = $LXC_NET_HWADDR/" $path/config-network
+       fi
+    fi
+    # Remove blank and commented network lines (Ex. #lxc.network...)
+    sed -i -e 's/^#lxc.network.*$//g' -e '/^[[:space:]]*$/d' $path/config-network
+    # Add net config
+    cat $path/config-network >> $path/config
+    rm $path/config-network
+
+    # This "original" code from lxc-debian doesn't do anything but verify the previously executed command.
+    if [ $? -ne 0 ]; then
+        echo "Failed to add configuration"
+        return 1
+    fi
+
+    return 0
+}
+
+post_process()
+{
+    local rootfs="$1";  shift
+    local release="$1"; shift
+    local arch="$1"; shift
+    local hostarch="$1"; shift
+    local packages="$*"
+    echo "post_process $@"
+    # Disable service startup
+    cat > ${rootfs}/usr/sbin/policy-rc.d << EOF
+#!/bin/sh
+exit 101
+EOF
+    chmod +x ${rootfs}/usr/sbin/policy-rc.d
+
+    # If the container isn't running a native architecture, setup multiarch
+    if [ "${arch}" != "${hostarch}" ]; then
+        # Test if dpkg supports multiarch
+        if chroot $rootfs dpkg --print-foreign-architectures >/dev/null 2>&1; then
+            chroot $rootfs dpkg --add-architecture ${hostarch}
+        fi
+    fi
+
+    # Write a new sources.list containing both native and multiarch entries
+    > ${rootfs}/etc/apt/sources.list
+    if [ "${arch}" != "${hostarch}" ]; then
+        write_sourceslist ${rootfs} ${release} ${arch}
+    else
+        write_sourceslist ${rootfs} ${release}
+    fi
+
+    # Greg Olsen 2016-05-04
+    # Write a new apt.conf.d/01lean to help keep things minimal
+    > ${rootfs}/etc/apt/apt.conf.d/01lean
+    write_apt_conf_d ${rootfs}
+
+    # Install Packages in container
+    if [ -n "${packages}" ]; then
+        local pack_list="`echo ${packages} | sed 's/,/ /g'`"
+        echo "Installing packages: ${pack_list}"
+        install_packages ${rootfs} ${pack_list}
+    fi
+
+    # Greg Olsen 2016-05-04
+    # Write /etc/resolvconf/resolv.conf.d/tail
+    write_resolv_conf_d_tail ${rootfs}
+
+    # Re-enable service startup
+    rm ${rootfs}/usr/sbin/policy-rc.d
+
+    # reconfigure locales
+    if [ -z "$LANG" ]; then
+        cat >> $rootfs/etc/locale.gen << EOF
+en_US.UTF-8 UTF-8
+EOF
+        chroot $rootfs locale-gen en_US.UTF-8 UTF-8
+        chroot $rootfs update-locale LANG=en_US.UTF-8
+    else
+        encoding=$(echo $LANG | cut -d. -f2)
+        chroot $rootfs sed -e "s/^# \(${LANG} ${encoding}\)/\1/" \
+            -i /etc/locale.gen 2> /dev/null
+        cat >> $rootfs/etc/locale.gen << EOF
+$LANG $encoding
+EOF
+        chroot $rootfs locale-gen $LANG $encoding
+        chroot $rootfs update-locale LANG=$LANG
+    fi
+
+    # Greg Olsen 2016-05-12
+    # Warning:   stdin: is not a tty
+    # Caused by: Executing /usr/bin/mesg when not connected to tty.
+    # Can happen using lxc-attach (depending on what you do).
+    # Fix:       Make /root.profile call mesg only if connected to tty:
+    #              -change: "mesg n"  to  "test -t 0 && mesg n"
+    if [[ -f "${rootfs}/root/.profile" ]]; then
+       sed -i -e 's/^mesg n$/test -t 0 \&\& mesg n/g' ${rootfs}/root/.profile
+    fi
+    # end
+}
+
+# Greg Olsen 2016-05-04
+# - new function
+purge_packages ()
+{
+    # Package list to be purged (space separated)
+    local purge_packages=\
+gcc-4.8-base
+
+    local rootfs="$1"
+    local rc=0
+
+    # Purge unnecessary packages
+    if [[ -n "${purge_packages}" ]]; then
+       for p in ${purge_packages}
+       do
+          chroot ${rootfs} apt-get -y -q -o=Dpkg::Use-Pty=0 purge ${p}
+          if [[ $? -ne 0 ]] ; then
+             echo "Failed to purge: ${p}"
+             rc=1
+          elif [[ -f "${rootfs}/var/cache/apt/archives/$p*.deb" ]]; then
+             echo "Deleting ${rootfs}/var/cache/apt/archives/$p*.deb"
+             rm -f "${rootfs}/var/cache/apt/archives/$p*.deb"
+          fi
+       done
+    fi
+    # ensure dpkg not locked (probably not needed, but doesn't hurt)
+    rm -f "${rootfs}/var/lib/dpkg/lock"
+    return $rc
+}
+
+clean()
+{
+    cache="$LOCALSTATEDIR/cache/lxc/devuan"
+
+    if [ ! -e $cache ]; then
+        exit 0
+    fi
+
+    # lock, so we won't purge while someone is creating a repository
+    (
+        flock -x 9
+        if [ $? != 0 ]; then
+            echo "Cache repository is busy."
+            exit 1
+        fi
+
+        echo -n "Purging the download cache..."
+        rm --preserve-root --one-file-system -rf $cache && echo "Done." || exit 1
+        exit 0
+
+    ) 9>$LOCALSTATEDIR/lock/subsys/lxc-devuan
+}
+
+# 2016-05-04 Greg Olsen
+# - Update usage with Devuan release names
+usage()
+{
+    cat <<EOF
+Template specific options can be passed to lxc-create after a '--' like this:
+
+  lxc-create --name=NAME [-lxc-create-options] -- [-template-options]
+
+Usage: $1 -h|--help -p|--path=<path> [-c|--clean] [-a|--arch=<arch>] [-r|--release=<release>]
+                                     [--mirror=<mirror>] [--security-mirror=<security mirror>]
+                                     [--package=<package_name1,package_name2,...>]
+
+Options :
+
+  -h, --help             print this help text
+  -p, --path=PATH        directory where config and rootfs of this VM will be kept
+  -a, --arch=ARCH        The container architecture. Can be one of: i686, x86_64,
+                         amd64, armhf, armel, powerpc. Defaults to host arch.
+  -r, --release=RELEASE  Devuan release. Can be one of: jessie, ascii, ceres.
+                         Defaults to current stable.
+  --mirror=MIRROR        Devuan mirror to use during installation. Overrides the MIRROR
+                         environment variable (see below).
+  --security-mirror=SECURITY_MIRROR
+                         Devuan mirror to use for security updates. Overrides the
+                         SECURITY_MIRROR environment variable (see below).
+  --packages=PACKAGE_NAME1,PACKAGE_NAME2,...
+                         List of additional packages to install. Comma separated, without space.
+  -c, --clean            only clean up the cache and terminate
+  --main-only            include only Devuan's main repository (i.e. no contrib and non-free).
+
+Environment variables:
+
+  MIRROR                 The Devuan package mirror to use. See also the --mirror switch above.
+                         Defaults to '$MIRROR'
+  SECURITY_MIRROR        The Devuan package security mirror to use. See also the --security-mirror switch above.
+                         Defaults to '$SECURITY_MIRROR'
+
+EOF
+    return 0
+}
+
+options=$(getopt -o hp:n:a:r:c -l arch:,clean,help,main-only,mirror:,name:,packages:,path:,release:,rootfs:,security-mirror: -- "$@")
+if [ $? -ne 0 ]; then
+        usage $(basename $0)
+        exit 1
+fi
+eval set -- "$options"
+
+arch=$(uname -m)
+if [ "$arch" = "i686" ]; then
+    arch="i386"
+elif [ "$arch" = "x86_64" ]; then
+    arch="amd64"
+elif [ "$arch" = "armv7l" ]; then
+    arch="armhf"
+fi
+hostarch=$arch
+
+while true
+do
+    case "$1" in
+        -h|--help)            usage $0 && exit 1;;
+           --)                shift 1; break ;;
+
+        -a|--arch)            arch=$2; shift 2;;
+        -c|--clean)           clean=1; shift 1;;
+           --main-only)       mainonly=1; shift 1;;
+           --mirror)          MIRROR=$2; shift 2;;
+        -n|--name)            name=$2; shift 2;;
+           --packages)        packages=$2; shift 2;;
+        -p|--path)            path=$2; shift 2;;
+        -r|--release)         release=$2; shift 2;;
+           --rootfs)          rootfs=$2; shift 2;;
+           --security-mirror) SECURITY_MIRROR=$2; shift 2;;
+        *)                    break ;;
+    esac
+done
+
+if [ ! -z "$clean" -a -z "$path" ]; then
+    clean || exit 1
+    exit 0
+fi
+
+if [ "$arch" = "i686" ]; then
+    arch=i386
+fi
+
+if [ "$arch" = "x86_64" ]; then
+    arch=amd64
+fi
+
+if [ $hostarch = "i386" -a $arch = "amd64" ]; then
+    echo "can't create $arch container on $hostarch"
+    exit 1
+fi
+
+if [ $hostarch = "armhf" -o $hostarch = "armel" ] && \
+   [ $arch != "armhf" -a $arch != "armel" ]; then
+    echo "can't create $arch container on $hostarch"
+    exit 1
+fi
+
+if [ $hostarch = "powerpc" -a $arch != "powerpc" ]; then
+    echo "can't create $arch container on $hostarch"
+    exit 1
+fi
+
+type debootstrap
+if [ $? -ne 0 ]; then
+    echo "'debootstrap' command is missing"
+    exit 1
+fi
+
+if [ -z "$path" ]; then
+    echo "'path' parameter is required"
+    exit 1
+fi
+
+if [ "$(id -u)" != "0" ]; then
+    echo "This script should be run as 'root'"
+    exit 1
+fi
+
+current_release=`wget ${MIRROR}/dists/stable/Release -O - 2> /dev/null | head |awk '/^Codename: (.*)$/ { print $2; }'`
+release=${release:-${current_release}}
+# 2016-05-04 Greg Olsen
+# - switch to Devuan releases
+#         ==>    Stable  Testing Unstable
+valid_releases=('jessie' 'ascii' 'ceres')
+if [[ ! "${valid_releases[*]}" =~ (^|[^[:alpha:]])$release([^[:alpha:]]|$) ]]; then
+    echo "Invalid release ${release}, valid ones are: ${valid_releases[*]}"
+    exit 1
+fi
+
+# detect rootfs
+config="$path/config"
+if [ -z "$rootfs" ]; then
+    if grep -q '^lxc.rootfs' $config 2> /dev/null ; then
+        rootfs=$(awk -F= '/^lxc.rootfs =/{ print $2 }' $config)
+    else
+        rootfs=$path/rootfs
+    fi
+fi
+
+install_devuan $rootfs $release $arch
+if [ $? -ne 0 ]; then
+    echo "failed to install devuan"
+    exit 1
+fi
+
+configure_devuan $rootfs $name
+if [ $? -ne 0 ]; then
+    echo "failed to configure devuan for a container"
+    exit 1
+fi
+
+copy_configuration $path $rootfs $name $arch
+if [ $? -ne 0 ]; then
+    echo "failed write configuration file"
+    exit 1
+fi
+
+post_process ${rootfs} ${release} ${arch} ${hostarch} ${packages}
+
+purge_packages ${rootfs}
+if [ $? -ne 0 ]; then
+    echo "Warning: purge_packages non-zero exit status"
+fi
+
+if [ ! -z "$clean" ]; then
+    clean || exit 1
+    exit 0
+fi
